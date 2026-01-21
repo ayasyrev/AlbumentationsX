@@ -20,9 +20,11 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Install uv and set Python version ${{ matrix.python-version }}
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v7
       with:
+        enable-cache: true
         python-version: ${{ matrix.python-version }}
+        activate-environment: true
 
     - name: Install PyTorch
       run: |
@@ -62,9 +64,11 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Install uv and set Python version ${{ matrix.python-version }}
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v7
       with:
+        enable-cache: true
         python-version: ${{ matrix.python-version }}
+        activate-environment: true
 
     - name: Install all requirements
       run: |
@@ -86,9 +90,11 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     - name: Install uv and set Python version ${{ matrix.python-version }}
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v7
       with:
+        enable-cache: true
         python-version: ${{ matrix.python-version }}
+        activate-environment: true
     - name: Install all requirements
       run: |
         uv pip install opencv-python-headless>=4.9.0.80 requests

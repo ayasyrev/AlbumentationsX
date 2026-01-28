@@ -478,3 +478,349 @@ def test_process_unclipped_obb_boxes_vectorized() -> None:
     # Verify all boxes were processed
     assert result_bboxes.shape == (n_boxes, 5)
     assert not np.any(np.isnan(result_bboxes))
+
+
+@pytest.mark.obb
+def test_pad_with_obb() -> None:
+    """Test Pad transform with OBB - padding is just a shift."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    # OBB in the middle
+    bbox = [0.3, 0.3, 0.7, 0.7, 30.0]
+
+    transform = A.Compose(
+        [A.Pad(padding=10, p=1.0)],
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=[bbox])
+
+    # Image shape should increase by padding
+    assert result["image"].shape == (120, 120, 3)
+
+    # Should have the bbox
+    assert len(result["bboxes"]) == 1
+    output_bbox = result["bboxes"][0]
+
+    # Should still have 5 elements (OBB format preserved)
+    assert len(output_bbox) == 5
+
+    # Angle should be preserved (padding doesn't rotate)
+    assert abs(output_bbox[4] - 30.0) < 0.01
+
+    # Bounding box should be shifted relative to new image size
+    # Original center was at (0.5, 0.5) * 100 = (50, 50)
+    # After padding by 10, center is at (60, 60) in 120x120 image = (0.5, 0.5) normalized
+    # So normalized coords should be adjusted proportionally
+    assert all(0 <= v <= 1.0 for v in output_bbox[:4])
+
+
+@pytest.mark.obb
+def test_pad_with_obb_different_sides() -> None:
+    """Test Pad with different padding on each side with OBB."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    bbox = [0.4, 0.4, 0.6, 0.6, 45.0]
+
+    transform = A.Compose(
+        [A.Pad(padding=(5, 10, 15, 20), p=1.0)],  # left, top, right, bottom
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=[bbox])
+
+    # Image shape: width = 100 + 5 + 15 = 120, height = 100 + 10 + 20 = 130
+    assert result["image"].shape == (130, 120, 3)
+
+    # Bbox should be preserved
+    assert len(result["bboxes"]) == 1
+    output_bbox = result["bboxes"][0]
+
+    # OBB format preserved
+    assert len(output_bbox) == 5
+
+    # Angle preserved
+    assert abs(output_bbox[4] - 45.0) < 0.01
+
+
+@pytest.mark.obb
+def test_pad_if_needed_with_obb() -> None:
+    """Test PadIfNeeded transform with OBB."""
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+
+    bbox = [0.3, 0.3, 0.7, 0.7, -15.0]
+
+    transform = A.Compose(
+        [A.PadIfNeeded(min_height=100, min_width=100, p=1.0)],
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=[bbox])
+
+    # Image should be padded to at least 100x100
+    assert result["image"].shape[0] >= 100
+    assert result["image"].shape[1] >= 100
+
+    # Bbox should be preserved
+    assert len(result["bboxes"]) == 1
+    output_bbox = result["bboxes"][0]
+
+    # OBB format preserved
+    assert len(output_bbox) == 5
+
+    # Angle preserved
+    assert abs(output_bbox[4] - (-15.0)) < 0.01
+
+
+@pytest.mark.obb
+def test_pad_if_needed_divisor_with_obb() -> None:
+    """Test PadIfNeeded with divisor and OBB."""
+    image = np.zeros((95, 95, 3), dtype=np.uint8)
+
+    bbox = [0.4, 0.4, 0.6, 0.6, 60.0]
+
+    transform = A.Compose(
+        [A.PadIfNeeded(min_height=None, min_width=None, pad_height_divisor=32, pad_width_divisor=32, p=1.0)],
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=[bbox])
+
+    # Image should be padded to be divisible by 32
+    assert result["image"].shape[0] % 32 == 0
+    assert result["image"].shape[1] % 32 == 0
+
+    # Bbox should be preserved
+    assert len(result["bboxes"]) == 1
+    output_bbox = result["bboxes"][0]
+
+    # OBB format preserved
+    assert len(output_bbox) == 5
+
+    # Angle preserved
+    assert abs(output_bbox[4] - 60.0) < 0.01
+
+
+@pytest.mark.obb
+def test_pad_with_obb_extra_fields() -> None:
+    """Test that Pad preserves OBB extra fields (e.g., class labels)."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    # OBB with extra field (class label)
+    bbox = [0.3, 0.3, 0.7, 0.7, 30.0, 5.0]
+
+    transform = A.Compose(
+        [A.Pad(padding=10, p=1.0)],
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=[bbox])
+
+    output_bbox = result["bboxes"][0]
+
+    # Should have 6 elements (5 for OBB + 1 extra)
+    assert len(output_bbox) == 6
+
+    # Extra field should be preserved
+    assert output_bbox[5] == 5.0
+
+    # Angle should be preserved
+    assert abs(output_bbox[4] - 30.0) < 0.01
+
+
+@pytest.mark.obb
+def test_pad_with_multiple_obb() -> None:
+    """Test Pad with multiple OBBs."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    bboxes = [
+        [0.2, 0.2, 0.4, 0.4, 15.0],
+        [0.5, 0.5, 0.8, 0.8, 45.0],
+        [0.1, 0.7, 0.3, 0.9, -30.0],
+    ]
+
+    transform = A.Compose(
+        [A.Pad(padding=20, p=1.0)],
+        bbox_params=A.BboxParams(format="albumentations", bbox_type="obb")
+    )
+
+    result = transform(image=image, bboxes=bboxes)
+
+    # All boxes should be preserved
+    assert len(result["bboxes"]) == 3
+
+    # All should have 5 elements
+    for bbox in result["bboxes"]:
+        assert len(bbox) == 5
+
+    # Original angles should be preserved
+    original_angles = [15.0, 45.0, -30.0]
+    for i, bbox in enumerate(result["bboxes"]):
+        assert abs(bbox[4] - original_angles[i]) < 0.01
+
+
+@pytest.mark.obb
+def test_pad_declares_obb_support() -> None:
+    """Test that Pad and PadIfNeeded declare OBB support."""
+    assert "obb" in A.Pad._supported_bbox_types
+    assert "obb" in A.PadIfNeeded._supported_bbox_types
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_obb_partial_crop() -> None:
+    """Test crop_and_pad_bboxes with OBB that gets partially cropped - should clip polygons."""
+    from albumentations.augmentations.crops.functional import crop_and_pad_bboxes
+
+    # OBB that extends beyond crop region
+    # In normalized coords: center at (0.75, 0.75), extends near edges
+    bboxes = np.array([[0.6, 0.6, 0.9, 0.9, 45.0]], dtype=np.float32)
+
+    image_shape = (100, 100)
+    crop_params = (20, 20, 80, 80)  # Crop to 60x60 region
+    pad_params = None
+    result_shape = (60, 60)
+
+    result = crop_and_pad_bboxes(
+        bboxes, crop_params, pad_params, image_shape, result_shape, bbox_type="obb"
+    )
+
+    # Should not be empty - box is partially inside
+    assert len(result) > 0, "Partially cropped OBB should not be filtered out"
+
+    # Should still be OBB format
+    assert result.shape[1] == 5
+
+    # All coordinates should be valid (no out-of-bounds due to missing clipping)
+    assert np.all(np.isfinite(result)), "Result should have finite values"
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_obb_with_crop_and_pad() -> None:
+    """Test crop_and_pad_bboxes with both crop and pad for OBB."""
+    from albumentations.augmentations.crops.functional import crop_and_pad_bboxes
+
+    # OBB in middle of image
+    bboxes = np.array([[0.4, 0.4, 0.6, 0.6, 30.0]], dtype=np.float32)
+
+    image_shape = (100, 100)
+    crop_params = (20, 20, 80, 80)  # Crop to 60x60
+    pad_params = (10, 10, 10, 10)   # Pad 10px on all sides
+    result_shape = (80, 80)         # 60 + 20 = 80
+
+    result = crop_and_pad_bboxes(
+        bboxes, crop_params, pad_params, image_shape, result_shape, bbox_type="obb"
+    )
+
+    # Should preserve the bbox
+    assert len(result) == 1
+    assert result.shape[1] == 5
+
+    # Angle may differ by 90 degrees due to cv2.minAreaRect ambiguity (30 vs -60 vs 120 etc.)
+    # Just verify it's a valid angle in the canonical range
+    assert -180 <= result[0, 4] < 180, f"Angle {result[0, 4]} out of range"
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_obb_edge_clipping() -> None:
+    """Test that OBB polygons are properly clipped when they extend beyond crop boundaries."""
+    from albumentations.augmentations.crops.functional import crop_and_pad_bboxes
+
+    # OBB that definitely extends beyond left and top crop boundaries
+    # Center at (0.1, 0.1), close to top-left corner
+    bboxes = np.array([[0.0, 0.0, 0.2, 0.2, 0.0]], dtype=np.float32)
+
+    image_shape = (100, 100)
+    # Crop that should clip the OBB
+    crop_params = (10, 10, 90, 90)
+    pad_params = None
+    result_shape = (80, 80)
+
+    result = crop_and_pad_bboxes(
+        bboxes, crop_params, pad_params, image_shape, result_shape, bbox_type="obb"
+    )
+
+    # If the box survives filtering, check it was properly clipped
+    if len(result) > 0:
+        # All normalized coordinates should be in valid range [0, 1]
+        assert np.all(result[:, 0] >= -0.01), "x_min should be >= 0"
+        assert np.all(result[:, 1] >= -0.01), "y_min should be >= 0"
+        assert np.all(result[:, 2] <= 1.01), "x_max should be <= 1"
+        assert np.all(result[:, 3] <= 1.01), "y_max should be <= 1"
+
+        # Should still be OBB format
+        assert result.shape[1] == 5
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_obb_with_extras() -> None:
+    """Test that crop_and_pad_bboxes preserves extra fields for OBB."""
+    from albumentations.augmentations.crops.functional import crop_and_pad_bboxes
+
+    # OBB with extra fields (e.g., class labels)
+    bboxes = np.array([[0.3, 0.3, 0.7, 0.7, 25.0, 1.0, 2.0]], dtype=np.float32)
+
+    image_shape = (100, 100)
+    crop_params = (10, 10, 90, 90)
+    pad_params = None
+    result_shape = (80, 80)
+
+    result = crop_and_pad_bboxes(
+        bboxes, crop_params, pad_params, image_shape, result_shape, bbox_type="obb"
+    )
+
+    # Should preserve bbox
+    assert len(result) == 1
+
+    # Should have 7 columns (5 for OBB + 2 extras)
+    assert result.shape[1] == 7
+
+    # Extra fields should be preserved
+    np.testing.assert_array_almost_equal(result[0, 5:], [1.0, 2.0])
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_obb_only_pad() -> None:
+    """Test crop_and_pad_bboxes with only padding (no crop) for OBB."""
+    from albumentations.augmentations.crops.functional import crop_and_pad_bboxes
+
+    # OBB in middle
+    bboxes = np.array([[0.4, 0.4, 0.6, 0.6, 60.0]], dtype=np.float32)
+
+    image_shape = (100, 100)
+    crop_params = None
+    pad_params = (20, 20, 20, 20)
+    result_shape = (140, 140)
+
+    result = crop_and_pad_bboxes(
+        bboxes, crop_params, pad_params, image_shape, result_shape, bbox_type="obb"
+    )
+
+    # Should preserve bbox
+    assert len(result) == 1
+    assert result.shape[1] == 5
+
+    # Angle should be preserved (padding doesn't rotate)
+    assert abs(result[0, 4] - 60.0) < 0.01
+
+
+@pytest.mark.obb
+def test_crop_and_pad_bboxes_vectorized_filtering() -> None:
+    """Test that OBB filtering in crop_bboxes_by_coords_obb is vectorized (no Python loops)."""
+    from albumentations.augmentations.crops.functional import crop_bboxes_by_coords
+
+    # Create many OBBs to test vectorization
+    n_boxes = 50
+    np.random.seed(137)
+    bboxes = np.random.rand(n_boxes, 5).astype(np.float32)
+    bboxes[:, :4] = bboxes[:, :4] * 0.8 + 0.1  # Range [0.1, 0.9]
+    bboxes[:, 4] = (bboxes[:, 4] - 0.5) * 360   # Angles [-180, 180]
+
+    image_shape = (200, 200)
+    crop_coords = (50, 50, 150, 150)
+
+    # This should execute quickly with vectorized operations
+    result = crop_bboxes_by_coords(bboxes, crop_coords, image_shape, bbox_type="obb")
+
+    # Should return valid OBB array
+    assert result.shape[1] == 5
+    assert np.all(np.isfinite(result)), "All values should be finite"

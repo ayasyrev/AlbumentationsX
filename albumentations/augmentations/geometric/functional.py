@@ -1268,9 +1268,7 @@ def bboxes_affine(
         return bboxes
 
     if bbox_type == "obb":
-        if border_mode in REFLECT_BORDER_MODES:
-            msg = "OBB bboxes are not supported for affine with reflection padding"
-            raise NotImplementedError(msg)
+        # For OBB: convert to polygons, apply transform, convert back
         polygons, extras = _split_polygons_and_extras(bboxes)
         polygons = polygons.copy()
         polygons[..., 0] *= image_shape[1]
@@ -1279,8 +1277,8 @@ def bboxes_affine(
         transformed_polygons[..., 0] /= output_shape[1]
         transformed_polygons[..., 1] /= output_shape[0]
         transformed_bboxes = polygons_to_obb(transformed_polygons, extra_fields=extras)
-        validated_bboxes = validate_bboxes(transformed_bboxes, output_shape)
-        return normalize_bboxes(validated_bboxes, output_shape)
+        # transformed_bboxes are in normalized coordinates; validate against a virtual 1x1 image
+        return validate_bboxes(transformed_bboxes, (1, 1))
 
     bboxes = denormalize_bboxes(bboxes, image_shape)
 
@@ -4000,9 +3998,6 @@ def bboxes_grid_shuffle(
         np.ndarray: Shuffled bounding boxes
 
     """
-    if bbox_type == "obb":
-        msg = "OBB bboxes are not supported for bboxes_grid_shuffle"
-        raise NotImplementedError(msg)
     # Convert bboxes to masks
     masks = masks_from_bboxes(bboxes, image_shape)
 
@@ -4482,9 +4477,6 @@ def bboxes_morphology(
         np.ndarray: The morphology applied to the bounding boxes.
 
     """
-    if bbox_type == "obb":
-        msg = "OBB bboxes are not supported for bboxes_morphology"
-        raise NotImplementedError(msg)
     bboxes = bboxes.copy()
     masks = masks_from_bboxes(bboxes, image_shape)
     masks = morphology(masks, kernel, operation)

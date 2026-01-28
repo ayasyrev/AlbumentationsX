@@ -273,6 +273,52 @@ class BboxProcessor(DataProcessor):
             msg = "Your 'label_fields' are not valid - them must have same names as params in dict"
             raise ValueError(msg)
 
+    def ensure_transforms_valid(self, transforms: Sequence[object]) -> None:
+        """Validate that all transforms support the configured bbox_type.
+
+        Args:
+            transforms: Sequence of transforms to validate.
+
+        Raises:
+            ValueError: If any DualTransform doesn't support OBB when bbox_type='obb'.
+
+        """
+        if self.params.bbox_type != "obb":
+            return  # Only validate for OBB
+
+        from albumentations.core.composition import BaseCompose
+        from albumentations.core.transforms_interface import DualTransform, ImageOnlyTransform
+
+        unsupported = []
+
+        def check_transform(transform: object) -> None:
+            # Skip ImageOnly (they don't touch bboxes)
+            if isinstance(transform, ImageOnlyTransform):
+                return
+
+            # Recursively check nested BaseCompose
+            if isinstance(transform, BaseCompose):
+                for t in transform.transforms:
+                    check_transform(t)
+                return
+
+            # Check DualTransforms
+            if isinstance(transform, DualTransform):
+                supported_types = getattr(transform, "_supported_bbox_types", frozenset({"hbb"}))
+                if "obb" not in supported_types:
+                    unsupported.append(transform.__class__.__name__)
+
+        # Check all transforms
+        for transform in transforms:
+            check_transform(transform)
+
+        if unsupported:
+            msg = (
+                f"The following transforms do not support OBB bounding boxes: {unsupported}. "
+                f"Either remove these transforms or use bbox_type='hbb'."
+            )
+            raise ValueError(msg)
+
     def filter(self, data: np.ndarray, shape: tuple[int, int] | tuple[int, int, int]) -> np.ndarray:
         """Filter bounding boxes based on size and visibility criteria.
 

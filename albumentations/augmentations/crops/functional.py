@@ -7,7 +7,7 @@ consistency between different data types during cropping operations.
 """
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -15,7 +15,14 @@ from albucore import maybe_process_in_chunks, preserve_channel_dim
 
 from albumentations.augmentations.geometric import functional as fgeometric
 from albumentations.augmentations.utils import handle_empty_array
-from albumentations.core.bbox_utils import denormalize_bboxes, normalize_bboxes
+from albumentations.core.bbox_utils import (
+    BBOX_OBB_MIN_COLUMNS,
+    denormalize_bboxes,
+    normalize_bbox_angles_decorator,
+    normalize_bboxes,
+    obb_to_polygons,
+    polygons_to_obb,
+)
 from albumentations.core.type_definitions import ImageType
 
 __all__ = [
@@ -71,46 +78,253 @@ def get_crop_coords(
     return x_min, y_min, x_max, y_max
 
 
+def _process_clipped_obb_boxes(
+    clipped_indices: np.ndarray,
+    polygons_clipped: np.ndarray,
+    crop_width: int,
+    crop_height: int,
+    extras: np.ndarray | None,
+) -> np.ndarray:
+    """Process OBB boxes that were clipped by crop boundaries.
+
+    Refits OBBs using cv2.minAreaRect for boxes with clipped corners.
+    """
+    clipped_polys = polygons_clipped[clipped_indices]
+
+    # Normalize clipped polygons
+    clipped_polys_norm = clipped_polys.copy()
+    clipped_polys_norm[..., 0] /= crop_width
+    clipped_polys_norm[..., 1] /= crop_height
+
+    # Fit new OBBs from clipped polygons
+    clipped_extras = extras[clipped_indices] if extras is not None else None
+    return polygons_to_obb(clipped_polys_norm, extra_fields=clipped_extras)
+
+
+def _process_unclipped_obb_boxes(
+    unclipped_indices: np.ndarray,
+    bboxes: np.ndarray,
+    image_shape: tuple[int, int],
+    crop_coords: tuple[int, int, int, int],
+    crop_width: int,
+    crop_height: int,
+    extras: np.ndarray | None,
+) -> np.ndarray:
+    """Process OBB boxes that were fully inside crop (vectorized center shift).
+
+    Preserves original angle and dimensions, only adjusts center position.
+    Returns transformed bboxes.
+    """
+    crop_x_min, crop_y_min = crop_coords[:2]
+    unclipped_bboxes = bboxes[unclipped_indices]
+
+    # Extract OBB parameters (vectorized)
+    x_min, y_min, x_max, y_max = (
+        unclipped_bboxes[:, 0],
+        unclipped_bboxes[:, 1],
+        unclipped_bboxes[:, 2],
+        unclipped_bboxes[:, 3],
+    )
+    angles = unclipped_bboxes[:, 4]
+
+    # Calculate original centers in pixels (vectorized)
+    center_x_px = (x_min * image_shape[1] + x_max * image_shape[1]) / 2
+    center_y_px = (y_min * image_shape[0] + y_max * image_shape[0]) / 2
+
+    # Adjust centers to crop region (vectorized)
+    new_center_x_px = center_x_px - crop_x_min
+    new_center_y_px = center_y_px - crop_y_min
+
+    # Calculate normalized dimensions (vectorized)
+    width_norm = x_max - x_min
+    height_norm = y_max - y_min
+
+    # Normalize new centers (vectorized)
+    new_center_x_norm = new_center_x_px / crop_width
+    new_center_y_norm = new_center_y_px / crop_height
+
+    # Calculate new bounds in normalized coords relative to crop (vectorized)
+    new_x_min = new_center_x_norm - width_norm * image_shape[1] / crop_width / 2
+    new_x_max = new_center_x_norm + width_norm * image_shape[1] / crop_width / 2
+    new_y_min = new_center_y_norm - height_norm * image_shape[0] / crop_height / 2
+    new_y_max = new_center_y_norm + height_norm * image_shape[0] / crop_height / 2
+
+    # Build new bboxes with same angles (vectorized)
+    num_bboxes = len(unclipped_indices)
+    num_cols = 5 if extras is None else 5 + extras.shape[1]
+    result = np.empty((num_bboxes, num_cols), dtype=bboxes.dtype)
+
+    result[:, 0] = new_x_min
+    result[:, 1] = new_y_min
+    result[:, 2] = new_x_max
+    result[:, 3] = new_y_max
+    result[:, 4] = angles
+
+    # Copy extra fields if present
+    if extras is not None:
+        result[:, 5:] = extras[unclipped_indices]
+
+    return result
+
+
+@normalize_bbox_angles_decorator()
+@handle_empty_array("bboxes")
+def crop_bboxes_by_coords_obb(
+    bboxes: np.ndarray,
+    crop_coords: tuple[int, int, int, int],
+    image_shape: tuple[int, int],
+) -> np.ndarray:
+    """Crop oriented bounding boxes using vectorized polygon-based method.
+
+    This function handles OBB cropping by:
+    1. Converting OBB to 4 corner polygons
+    2. Cropping polygon corners by the crop region
+    3. Detecting which boxes had corners clipped (vectorized)
+    4. For unclipped boxes: vectorized center shift (fast path, preserves angle)
+    5. For clipped boxes: fitting new OBB via cv2.minAreaRect (batch processing)
+
+    Args:
+        bboxes (np.ndarray): Array of OBB with shape (N, 5+) where each row is
+                             [x_min, y_min, x_max, y_max, angle, ...] in normalized coordinates.
+        crop_coords (tuple[int, int, int, int]): Crop coordinates (x_min, y_min, x_max, y_max)
+                                                 in absolute pixel values.
+        image_shape (tuple[int, int]): Original image shape (height, width).
+
+    Returns:
+        np.ndarray: Array of cropped OBB in normalized coordinates relative to crop region.
+
+    Note:
+        This implements the industry-standard polygon-based approach (PyTorch Torchvision).
+        Fully vectorized for performance - processes all boxes simultaneously.
+        Boxes fully inside the crop use fast vectorized center shift.
+        Boxes partially cropped get batch-refitted via cv2.minAreaRect.
+
+    """
+    # Extract extra fields if present (e.g., class labels)
+    extras = bboxes[:, 5:] if bboxes.shape[1] > BBOX_OBB_MIN_COLUMNS else None
+
+    # Step 1: Convert OBB to polygons (4 corners each)
+    polygons = obb_to_polygons(bboxes)  # Shape: (N, 4, 2) in normalized coords
+
+    # Step 2: Denormalize polygons to pixel coordinates
+    polygons_px = polygons.copy()
+    polygons_px[..., 0] *= image_shape[1]  # x coords
+    polygons_px[..., 1] *= image_shape[0]  # y coords
+
+    # Step 3: Subtract crop offset
+    crop_x_min, crop_y_min, crop_x_max, crop_y_max = crop_coords
+    polygons_cropped = polygons_px.copy()
+    polygons_cropped[..., 0] -= crop_x_min
+    polygons_cropped[..., 1] -= crop_y_min
+
+    # Step 4: Clip to crop boundaries
+    crop_height = crop_y_max - crop_y_min
+    crop_width = crop_x_max - crop_x_min
+    polygons_clipped = np.clip(
+        polygons_cropped,
+        [0, 0],
+        [crop_width, crop_height],
+    )
+
+    # Step 5: Check which boxes had corners changed (were clipped)
+    eps = 1e-6
+    clipped_mask = np.any(np.abs(polygons_cropped - polygons_clipped) > eps, axis=(1, 2))  # Shape: (N,)
+
+    # Step 6: Filter out boxes that are completely outside crop (all corners collapsed)
+    # A collapsed polygon will have all corners at the same point or very close
+    valid_mask = np.zeros(len(bboxes), dtype=bool)
+    for i, poly in enumerate(polygons_clipped):
+        # Check if polygon has non-zero area (corners are not all the same)
+        x_range = poly[:, 0].max() - poly[:, 0].min()
+        y_range = poly[:, 1].max() - poly[:, 1].min()
+        # Keep boxes with meaningful area (at least 1 pixel in both dimensions)
+        valid_mask[i] = x_range > 1.0 and y_range > 1.0
+
+    # Filter to valid boxes only
+    if not np.any(valid_mask):
+        # All boxes filtered out
+        empty_shape = (0, bboxes.shape[1]) if len(bboxes.shape) > 1 else (0, BBOX_OBB_MIN_COLUMNS)
+        return np.empty(empty_shape, dtype=np.float32)
+
+    # Keep only valid indices
+    valid_indices = np.where(valid_mask)[0]
+    filtered_bboxes = bboxes[valid_indices]
+    filtered_polygons_clipped = polygons_clipped[valid_indices]
+    filtered_clipped_mask = clipped_mask[valid_indices]
+    filtered_extras = extras[valid_indices] if extras is not None else None
+
+    # Step 7: Process clipped and unclipped boxes separately (vectorized)
+    result_bboxes = np.empty((len(filtered_bboxes), filtered_bboxes.shape[1]), dtype=np.float32)
+
+    # Handle clipped boxes (need refitting)
+    if np.any(filtered_clipped_mask):
+        clipped_indices = np.where(filtered_clipped_mask)[0]
+        new_obbs = _process_clipped_obb_boxes(
+            clipped_indices,
+            filtered_polygons_clipped,
+            crop_width,
+            crop_height,
+            filtered_extras,
+        )
+        result_bboxes[clipped_indices] = new_obbs
+
+    # Handle unclipped boxes (vectorized center shift)
+    if np.any(~filtered_clipped_mask):
+        unclipped_indices = np.where(~filtered_clipped_mask)[0]
+        result_bboxes[unclipped_indices] = _process_unclipped_obb_boxes(
+            unclipped_indices,
+            filtered_bboxes,
+            image_shape,
+            crop_coords,
+            crop_width,
+            crop_height,
+            filtered_extras,
+        )
+
+    return result_bboxes
+
+
 def crop_bboxes_by_coords(
     bboxes: np.ndarray,
     crop_coords: tuple[int, int, int, int],
     image_shape: tuple[int, int],
-    normalized_input: bool = True,
+    bbox_type: Literal["obb", "hbb"],
 ) -> np.ndarray:
     """Crop bounding boxes based on given crop coordinates.
 
     This function adjusts bounding boxes to fit within a cropped image.
+    Supports both HBB (axis-aligned) and OBB (oriented) bounding boxes.
 
     Args:
-        bboxes (np.ndarray): Array of bounding boxes with shape (N, 4+) where each row is
-                             [x_min, y_min, x_max, y_max, ...]. The bounding box coordinates
-                             can be either normalized (in [0, 1]) if normalized_input=True or
-                             absolute pixel values if normalized_input=False.
+        bboxes (np.ndarray): Array of normalized bounding boxes (Albumentations format) with shape (N, 4+)
+                             where each row is [x_min, y_min, x_max, y_max, ...] for HBB or
+                             [x_min, y_min, x_max, y_max, angle, ...] for OBB.
         crop_coords (tuple[int, int, int, int]): Crop coordinates (x_min, y_min, x_max, y_max)
                                                  in absolute pixel values.
         image_shape (tuple[int, int]): Original image shape (height, width).
-        normalized_input (bool): Whether input boxes are in normalized coordinates.
-                               If True, assumes input is normalized [0,1] and returns normalized coordinates.
-                               If False, assumes input is in absolute pixels and returns absolute coordinates.
-                               Default: True for backward compatibility.
+        bbox_type (Literal["obb", "hbb"]): Type of bounding box - "hbb" or "obb". Must be explicitly provided.
 
     Returns:
-        np.ndarray: Array of cropped bounding boxes. Coordinates will be in the same format as input
-                   (normalized if normalized_input=True, absolute pixels if normalized_input=False).
+        np.ndarray: Array of cropped bounding boxes in normalized coordinates (Albumentations format).
 
     Note:
         Bounding boxes that fall completely outside the crop area will be removed.
         Bounding boxes that partially overlap with the crop area will be adjusted to fit within it.
+        For OBB, uses polygon-based cropping with cv2.minAreaRect for partially clipped boxes.
 
     """
     if not bboxes.size:
         return bboxes
 
-    # Convert to absolute coordinates if needed
-    if normalized_input:
-        cropped_bboxes = denormalize_bboxes(bboxes.copy().astype(np.float32), image_shape)
-    else:
-        cropped_bboxes = bboxes.copy().astype(np.float32)
+    # Only process as OBB if explicitly bbox_type='obb'
+    # When bbox_type is None, default to HBB (handles HBB with extra columns like class labels)
+    is_obb = bbox_type == "obb"
+
+    if is_obb:
+        return crop_bboxes_by_coords_obb(bboxes, crop_coords, image_shape)
+
+    # HBB path - convert normalized to absolute, crop, then normalize back
+    cropped_bboxes = denormalize_bboxes(bboxes.copy().astype(np.float32), image_shape)
 
     x_min, y_min = crop_coords[:2]
 
@@ -123,8 +337,7 @@ def crop_bboxes_by_coords(
     crop_width = crop_coords[2] - crop_coords[0]
     crop_shape = (crop_height, crop_width)
 
-    # Return in same format as input
-    return normalize_bboxes(cropped_bboxes, crop_shape) if normalized_input else cropped_bboxes
+    return normalize_bboxes(cropped_bboxes, crop_shape)
 
 
 @handle_empty_array("keypoints")
@@ -263,17 +476,19 @@ def crop_and_pad_bboxes(
     pad_params: tuple[int, int, int, int] | None,
     image_shape: tuple[int, int],
     result_shape: tuple[int, int],
+    bbox_type: Literal["obb", "hbb"],
 ) -> np.ndarray:
     """Crop and pad bounding boxes.
 
-    This function crops and pads bounding boxes.
+    This function crops and pads bounding boxes. Supports both HBB and OBB.
 
     Args:
-        bboxes (np.ndarray): Array of bounding boxes.
+        bboxes (np.ndarray): Array of bounding boxes (HBB or OBB).
         crop_params (tuple[int, int, int, int] | None): Crop parameters.
         pad_params (tuple[int, int, int, int] | None): Pad parameters.
         image_shape (tuple[int, int]): Original image shape.
         result_shape (tuple[int, int]): Result image shape.
+        bbox_type (Literal["obb", "hbb"]): Type of bounding box - "hbb" or "obb". Must be explicitly provided.
 
     Returns:
         np.ndarray: Array of cropped and padded bounding boxes.
@@ -282,6 +497,40 @@ def crop_and_pad_bboxes(
     if len(bboxes) == 0:
         return bboxes
 
+    # Only process as OBB if explicitly bbox_type='obb'
+    is_obb = bbox_type == "obb"
+
+    if is_obb and crop_params is not None:
+        # For OBB with crop, use specialized OBB crop function
+        extras = bboxes[:, 5:] if bboxes.shape[1] > BBOX_OBB_MIN_COLUMNS else None
+
+        # Convert to polygons
+        polygons = obb_to_polygons(bboxes)  # normalized coords
+
+        # Denormalize to pixels
+        polygons_px = polygons.copy()
+        polygons_px[..., 0] *= image_shape[1]
+        polygons_px[..., 1] *= image_shape[0]
+
+        # Apply crop
+        crop_x, crop_y, _crop_x_max, _crop_y_max = crop_params
+        polygons_px[..., 0] -= crop_x
+        polygons_px[..., 1] -= crop_y
+
+        # Apply pad if needed
+        if pad_params is not None:
+            top, _, left, _ = pad_params
+            polygons_px[..., 0] += left
+            polygons_px[..., 1] += top
+
+        # Normalize to result shape
+        polygons_px[..., 0] /= result_shape[1]
+        polygons_px[..., 1] /= result_shape[0]
+
+        # Convert back to OBB
+        return polygons_to_obb(polygons_px, extra_fields=extras)
+
+    # HBB path - original logic
     # Denormalize bboxes
     denormalized_bboxes = denormalize_bboxes(bboxes, image_shape)
 

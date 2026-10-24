@@ -768,7 +768,7 @@ def exposure_match_batch(images: ImageType, gains: np.ndarray) -> ImageType:
     gain_shape = (*gains.shape, 1, 1, 1)
     result = np.multiply(images, gains.reshape(gain_shape), dtype=np.float32)
     np.clip(result, 0, MAX_VALUES_BY_DTYPE[images.dtype], out=result)
-    return cast("ImageType", result)
+    return cast("ImageType", result.astype(images.dtype, copy=False))
 
 
 def gamma_transform(img: ImageType, gamma: float) -> ImageType:

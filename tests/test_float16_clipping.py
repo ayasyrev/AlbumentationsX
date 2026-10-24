@@ -80,15 +80,65 @@ def test_multiplicative_noise_float_clipping(dtype, target, elementwise):
 
 
 @pytest.mark.parametrize("dtype", [np.float16, np.float32])
-def test_exposure_matching_image_float_clipping(dtype):
-    image = np.array([0, 0.25, 0.75, 1], dtype=dtype).reshape(2, 2, 1)
+@pytest.mark.parametrize("target", ["image", "images", "volume", "volumes"])
+@pytest.mark.parametrize("channels", [1, 3, 5])
+@pytest.mark.parametrize("strided", [False, True])
+def test_exposure_matching_float_clipping(dtype, target, channels, strided):
+    image = np.tile(np.array([0, 0.25, 0.75, 1], dtype=dtype).reshape(2, 2, 1), (1, 1, channels))
+    expected = np.tile(np.array([0, 0.375, 1, 1], dtype=dtype).reshape(2, 2, 1), (1, 1, channels))
+    if target != "image":
+        image = np.stack((image, image))
+        expected = np.stack((expected, expected))
+    if target == "volumes":
+        image = np.stack((image, image))
+        expected = np.stack((expected, expected))
+    if strided:
+        image = np.repeat(image, 2, axis=-2)[..., ::2, :]
+    image.setflags(write=False)
     original = image.copy()
-    transform = A.Compose([A.ExposureMatching(target_mean_range=(0.75, 0.75), p=1)], seed=137)
+    transform = A.Compose([A.ExposureMatching(target_mean_range=(0.75, 0.75), p=1)], seed=137, strict=True)
 
-    result = transform(image=image)["image"]
+    result = transform(**{target: image})[target]
 
+    assert result.shape == image.shape
     assert result.dtype == dtype
-    np.testing.assert_array_equal(result.ravel(), np.array([0, 0.375, 1, 1], dtype=dtype))
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(image, original)
+
+
+@pytest.mark.parametrize("target", ["image", "images", "volume", "volumes"])
+@pytest.mark.parametrize("factor", [0, 1, 2])
+@pytest.mark.parametrize("strided", [False, True])
+def test_color_jitter_half_rgb_saturation_matches_float32(target, factor, strided):
+    image = np.array([[[0.125, 0.25, 0.75], [1, 0.5, 0]]], dtype=np.float16)
+    if target != "image":
+        image = np.stack((image, image[..., ::-1]))
+    if target == "volumes":
+        image = np.stack((image, image))
+    if strided:
+        image = image[..., ::-1, :]
+    image.setflags(write=False)
+    original = image.copy()
+    transform = A.Compose(
+        [
+            A.ColorJitter(
+                brightness_range=(1, 1),
+                contrast_range=(1, 1),
+                saturation_range=(factor, factor),
+                hue_range=(0, 0),
+                p=1,
+            ),
+        ],
+        seed=137,
+        strict=True,
+    )
+    expected = transform(**{target: image.astype(np.float32)})[target].astype(np.float16)
+
+    result = transform(**{target: image})[target]
+
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
+    np.testing.assert_array_equal(result, expected)
     np.testing.assert_array_equal(image, original)
 
 

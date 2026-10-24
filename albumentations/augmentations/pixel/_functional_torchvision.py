@@ -210,6 +210,9 @@ def adjust_saturation_torchvision(
     if factor == 1 or is_grayscale_image(img):
         return img
 
+    if img.dtype.type is np.float16 and is_rgb_image(img):
+        # OpenCV requires float32; @clipped restores the input dtype after blending.
+        img = img.astype(np.float32)
     gray = to_gray_weighted_average(img) if is_rgb_image(img) else to_gray_average(img)
     gray_expanded = grayscale_to_multichannel(gray, img.shape[-1])
 
